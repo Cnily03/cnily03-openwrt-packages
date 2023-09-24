@@ -1,0 +1,219 @@
+name: Sync packages
+
+on:
+  push:
+    paths:
+      - '.github/**'
+  schedule:
+    - cron: 0 4 * * *
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target'
+        required: true
+        default: 'master'
+
+permissions:
+  contents: write
+
+jobs:
+  def-target:
+    name: Define Processing Targets
+    if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
+    runs-on: ubuntu-latest
+    env:
+      default_targets: master
+    outputs:
+      targets: ${{ steps.from-dispatch.outputs.targets }}
+      is_dispatch: ${{ steps.from-dispatch.outputs.is_dispatch }}
+    steps:
+      - name: Processing dispatch
+        id: from-dispatch
+        run: |
+          if [ "${{ github.event.inputs.target != null }}" == "true" ]; then
+            json_target="[\"$(
+              echo "${{ github.event.inputs.target }}" | sed 's/"/\\"/g' |
+              sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
+            )\"]"
+            echo "targets=$json_target" >> "$GITHUB_OUTPUT"
+            echo "is_dispatch=true" >> "$GITHUB_OUTPUT"
+          else
+            json_target="[\"$(
+              echo "${{ env.default_targets }}" | sed 's/"/\\"/g' |
+              sed 's/^[ \t]*//g;s/[ \t]*$//g;s/[ \t][ \t]*/ /g;s/ *, */","/g'
+            )\"]"
+            echo "targets=$json_target" >> "$GITHUB_OUTPUT"
+            echo "is_dispatch=false" >> "$GITHUB_OUTPUT"
+          fi
+  build:
+    name: Update ${{ matrix.target }}
+    needs: def-target
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.def-target.outputs.targets) }}
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+
+    - name: Initialize environment
+      id: init-env
+      run : |
+        echo ::group::"Setting git and time environment"
+        git config --global user.email "${{ vars.COMMIT_EMAIL }}"
+        git config --global user.name "${{ vars.COMMIT_NAME }}"
+        sudo timedatectl set-timezone "${{ env.TZ }}"
+        echo ::endgroup::
+
+        echo ::group::"Preparing workspace"
+        cd $GITHUB_WORKSPACE/..
+        hash=$(echo "$(date +%s%N).workspace" | md5sum | sed 's/[^0-9a-zA-Z]//g' | cut -c 1-8) && \
+        dirname="process.${{matrix.target}}.$hash" && mkdir -p "$dirname"
+        # mkdir -p ".git-root.$hash"
+        # mkdir -p ".github-root.$hash"
+        # mkdir -p "actions.$hash"
+        mkdir -p "former-files.$hash"
+        mkdir -p "former-packages.$hash"
+
+        mv -f "$GITHUB_WORKSPACE/.git" ./".git-root.$hash"
+        cp -rf "$GITHUB_WORKSPACE/.github" ./".github-root.$hash"
+        mv -f "$GITHUB_WORKSPACE/.github" ./"actions.$hash"
+        find "$GITHUB_WORKSPACE/" -mindepth 1 -maxdepth 1 -type f -exec mv -f {} ./"former-files.$hash"/ \;
+        find "$GITHUB_WORKSPACE/" -mindepth 1 -maxdepth 1 -type d -exec mv -f {} ./"former-packages.$hash"/ \;
+
+        find ./"actions.$hash" -type f -name *.sh -exec chmod +x {} \;
+        echo ::endgroup::
+
+        echo ::group::"Exporting environment variables"
+        echo DIR_WORKSPACE="$(pwd)/$dirname"                    >> "$GITHUB_ENV"
+        echo DIR_GIT_ROOT="$(pwd)/.git-root.$hash"              >> "$GITHUB_ENV"
+        echo DIR_GITHUB_ROOT="$(pwd)/.github-root.$hash"        >> "$GITHUB_ENV"
+        echo DIR_ACTIONS="$(pwd)/actions.$hash"                 >> "$GITHUB_ENV"
+        echo DIR_FORMER_FILES="$(pwd)/former-files.$hash"       >> "$GITHUB_ENV"
+        echo DIR_FORMER_PACKAGES="$(pwd)/former-packages.$hash" >> "$GITHUB_ENV"
+        echo TARGET="${{ matrix.target }}"                      >> "$GITHUB_ENV"
+        echo MERGE_FORMER_PACKAGES=true                         >> "$GITHUB_ENV"
+        echo ::endgroup::
+
+    - name: Update packages
+      # env:
+      #   DIR_WORKSPACE: ${{ env.DIR_WORKSPACE }}
+      #   DIR_GIT_ROOT: ${{ env.DIR_GIT_ROOT }}
+      #   DIR_GITHUB_ROOT: ${{ env.DIR_GITHUB_ROOT }}
+      #   DIR_ACTIONS: ${{ env.DIR_ACTIONS }}
+      #   DIR_FORMER_FILES: ${{ env.DIR_FORMER_FILES }}
+      #   DIR_FORMER_PACKAGES: ${{ env.DIR_FORMER_PACKAGES }}
+      #   TARGET: ${{ env.TARGET }}
+      #   MERGE_FORMER_PACKAGES: ${{ env.MERGE_FORMER_PACKAGES }}
+      run: |
+        # ---> Generating
+        # echo ::group::"Generating packages"
+        echo "===> Generating packages"
+
+        cd "$DIR_WORKSPACE"
+
+        if [ ! -f "$DIR_ACTIONS/fetch/entry.sh" ]; then
+          echo ::error::"No "fetch/entry.sh" found in actions"
+          exit 1
+        fi
+
+        if [ "${{ needs.def-target.outputs.is_dispatch }}" == "true" ]; then
+          if [ -f "$DIR_ACTIONS/fetch/dispatch/entry-${{ matrix.target }}.sh" ]; then
+            echo "Running fetch/dispatch/entry-${{ matrix.target }}.sh"
+            bash "$DIR_ACTIONS/fetch/dispatch/entry-${{ matrix.target }}.sh"
+          else
+            echo ::warning::"No "fetch/dispatch/entry-${{ matrix.target }}.sh" found in actions"
+            echo "Running fetch/entry.sh"
+            bash "$DIR_ACTIONS/fetch/entry.sh"
+          fi
+        else
+          echo "Running fetch/entry.sh"
+          bash "$DIR_ACTIONS/fetch/entry.sh"
+        fi
+
+        cd "$GITHUB_WORKSPACE"
+
+        # echo :endgroup::
+        echo "<=== Generating done"
+
+
+        # ---> Merging
+        echo ::group::"Merging packages"
+
+        echo ::notice::"MERGE_FORMER_PACKAGES=$MERGE_FORMER_PACKAGES"
+
+        [ "$MERGE_FORMER_PACKAGES" == "true" ] && {
+          # Move Priority: work(dir) > work(dir) > new(file) > former(file)
+          for item in $(ls -A $DIR_FORMER_PACKAGES); do
+            [ -z "$item" ] && continue
+            # former(dir)
+            if [ -d "$DIR_FORMER_PACKAGES/$item" ]; then
+              if [ -d "$DIR_WORKSPACE/$item" ]; then
+                echo "Updating package \"$item\"..."
+                mv -f "$DIR_WORKSPACE/$item" "$GITHUB_WORKSPACE/$item"
+              else
+                echo "Reserving package \"$item\"..."
+                mv -f "$DIR_FORMER_PACKAGES/$item" "$GITHUB_WORKSPACE/$item"
+              fi
+            # former(file)
+            else
+              if [ -e "$DIR_WORKSPACE/$item" ]; then
+                echo "Updating non-package file \"$item\"..."
+                mv -f "$DIR_WORKSPACE/$item" "$GITHUB_WORKSPACE/$item"
+              else
+                echo "Reserving non-package file \"$item\"..."
+                mv -f "$DIR_FORMER_PACKAGES/$item" "$GITHUB_WORKSPACE/$item"
+              fi
+            fi
+          done
+        }
+        for item in $(ls -A $DIR_WORKSPACE); do
+          [ -z "$item" ] && continue
+          # work(dir)
+          if [ -d "$DIR_WORKSPACE/$item" ]; then
+            echo "Adding package \"$item\"..."
+            mv -f "$DIR_WORKSPACE/$item" "$GITHUB_WORKSPACE/$item"
+          # work(file)
+          elif [ ! -d "$GITHUB_WORKSPACE/$item" ]; then
+            echo "Adding non-package file \"$item\"..."
+            mv -f "$DIR_WORKSPACE/$item" "$GITHUB_WORKSPACE/$item"
+          fi
+        done
+
+        echo ::endgroup::
+
+
+        # ---> Restoring (important)
+        echo ::group::"Restoring important resources"
+
+        echo "Restoring .git..."
+        rm -rf "$GITHUB_WORKSPACE/.git"
+        mv -f "$DIR_GIT_ROOT" "$GITHUB_WORKSPACE/.git"
+        echo "Restoring .github..."
+        rm -rf "$GITHUB_WORKSPACE/.github"
+        mv -f "$DIR_GITHUB_ROOT" "$GITHUB_WORKSPACE/.github"
+
+        echo ::endgroup::
+
+
+    - name: Upload repository
+      run: |
+        echo ::add-mask::"${{ secrets.ACCESS_TOKEN }}"
+
+        if git status --porcelain | grep -q .; then
+          git add . ":!/.github"
+          git commit -am "update $(date '+%Y-%m-%d %H:%M:%S')" | head -n 2
+          git push --force "https://${{ secrets.ACCESS_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:${{matrix.target}}
+        else
+          echo "nothing to commit"
+          exit 0
+        fi

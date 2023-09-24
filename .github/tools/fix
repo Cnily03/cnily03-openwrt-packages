@@ -1,0 +1,1 @@
+function fix_upx() { "$DIR_ACTIONS/src/fix/upx.sh" "$@"; }

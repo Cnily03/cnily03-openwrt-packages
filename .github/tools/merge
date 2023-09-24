@@ -1,0 +1,1 @@
+function merge() { "$DIR_ACTIONS/src/merge.sh" "$@"; }
